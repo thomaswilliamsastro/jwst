@@ -6,6 +6,7 @@ from stdatamodels.jwst import datamodels
 
 from . import subtract_images
 from astropy.stats import sigma_clip
+from astropy.nddata.bitmask import interpret_bit_flags, bitfield_to_boolean_mask
 from astropy.utils.exceptions import AstropyUserWarning
 
 import logging
@@ -209,7 +210,14 @@ def background_sub(input_model, bkg_list, sigma, maxiters):
     # Subtract the average background from the member
     log.info(f"Subtracting avg bkg from {input_model.meta.filename}")
 
-    result = subtract_images.subtract(input_model, bkg_model)
+    do_sub_background_matching = True
+
+    result = subtract_images.subtract(input_model,
+                                      bkg_model,
+                                      do_sub_background_matching=do_sub_background_matching,
+                                      sigma=sigma,
+                                      maxiters=maxiters,
+                                      )
 
     # We're done. Return the background model and the result.
     return bkg_model, result
@@ -253,6 +261,9 @@ def average_background(input_model, bkg_list, sigma, maxiters):
     cdata = np.zeros((num_bkg,) + image_shape)
     cerr = cdata.copy()
 
+    # Keep track of the clipped data per image
+    mdata_clip = []
+
     if bkg_dim == 3:
         accum_dq_arr = np.zeros((image_shape), dtype=np.uint32)
 
@@ -271,6 +282,21 @@ def average_background(input_model, bkg_list, sigma, maxiters):
             continue
 
         bkg_data, bkg_err, bkg_dq = im_array.get_subset_array(bkg_array)
+
+        # Because the backgrounds can be different between background observations,
+        # calculate a sigma-clipped mean of the good data here to account for that
+        # later
+
+        # Only use good avg DQ bits
+        dq_bits = interpret_bit_flags(bit_flags="~DO_NOT_USE+NON_SCIENCE",
+                                      flag_name_map=datamodels.dqflags.pixel,
+                                      )
+
+        dq_bit_mask = bitfield_to_boolean_mask(
+            avg_bkg.dq.astype(np.uint8), dq_bits, good_mask_value=0, dtype=np.uint8
+        )
+
+        mdata_clip.append(sigma_clip(bkg_data[dq_bit_mask == 0], sigma=sigma, maxiters=maxiters))
 
         if bkg_dim == 2:
             # Accumulate the data from this background image
@@ -296,6 +322,18 @@ def average_background(input_model, bkg_list, sigma, maxiters):
             for i_nint in range(bkg_dq.shape[0]):
                 accum_dq_arr = np.bitwise_or(bkg_dq[i_nint, :, :], accum_dq_arr)
             avg_bkg.dq = np.bitwise_or(avg_bkg.dq, accum_dq_arr)
+
+    # Calculate the sigma-clipped means for each image
+    mdata_means = np.array([mdata_clip[i][np.isfinite(mdata_clip[i])].mean()
+                            for i in range(cdata.shape[0])
+                            ])
+
+    # Calculate the offset from the mean in each case
+    mdata_means -= np.nanmean(mdata_means)
+
+    # And finally, subtract this from the data
+    for i in range(cdata.shape[0]):
+        cdata[i, ...] -= mdata_means[i]
 
     # Clip the background data
     log.debug(f"clip with sigma={sigma} maxiters={maxiters}")
